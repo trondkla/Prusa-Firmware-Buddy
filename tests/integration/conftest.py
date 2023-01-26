@@ -3,11 +3,17 @@ import binascii
 import functools
 import asyncio
 import pytest_asyncio
+from _pytest.stash import StashKey
+from _pytest.reports import CollectReport
 import hashlib
 import pytest
 import json
 import shutil
 from pathlib import Path
+import platform
+import logging
+
+logger = logging.getLogger('conftest')
 
 # add the /utils to PATH so we can use the `simulator` package
 project_root = Path(__file__).resolve().parent.parent.parent
@@ -71,6 +77,36 @@ def simulator_scriptio_port(unused_tcp_port_factory):
 
 
 @pytest.fixture
+def qemu_img_path(simulator_path) -> Path:
+    if platform.system() == "Windows":
+        qemu_img_exe_path = simulator_path.parent / "qemu-img.exe"
+        return Path(qemu_img_exe_path)
+    else:
+        return "qemu-img" # on linux system this tool is a part of qemu-utils package
+
+
+async def create_qcow2_image_file(qemu_img_binary_path, file_name, file_size):
+    params = ['create', '-f', 'qcow2', '-o', 'preallocation=metadata', str(file_name), str(file_size)]
+    logger.info('starting qemu_img with command: %s %s', qemu_img_binary_path, ' '.join(params))
+    process = await asyncio.create_subprocess_exec(str(qemu_img_binary_path), *params)
+    return_code = await process.wait()
+    if return_code != 0:
+        raise Exception("qemu_img returned " +str(return_code))
+
+
+@pytest_asyncio.fixture
+async def snapshots_image_file_path(qemu_img_path, tmpdir):
+    snapshots_path = tmpdir / 'snapshots.qcow2'
+    file_size = 2**23
+    await create_qcow2_image_file(qemu_img_path, snapshots_path, file_size)
+    return snapshots_path
+
+@pytest.fixture
+def debug_command_file_path(tmpdir):
+    file = tmpdir / 'debug_command.txt'
+    return file
+
+@pytest.fixture
 def simulator_proxy_port(unused_tcp_port_factory):
     return unused_tcp_port_factory()
 
@@ -126,13 +162,11 @@ async def prepare_xflash_content(firmware_path, basic_printer_arguments,
 
 @pytest_asyncio.fixture
 async def xflash_content(basic_printer_arguments, firmware_path, tmpdir,
-                         request):
+                         request, qemu_img_path):
     # create empty xflash content
     xflash_size = 2**23
-    xflash_path = tmpdir / 'xflash.bin'
-    with open(xflash_path, 'wb') as f:
-        f.seek(xflash_size - 1)
-        f.write(b'\x00')
+    xflash_path = tmpdir / 'xflash.qcow2'
+    await create_qcow2_image_file(qemu_img_path, xflash_path, xflash_size)
 
     # xflash content
     requested_xflash_hash = get_hash('v1', Path(firmware_path))
@@ -184,16 +218,14 @@ async def prepare_eeprom_content(eeprom_variables, basic_printer_arguments,
 
 @pytest_asyncio.fixture
 async def eeprom_content(eeprom_variables, basic_printer_arguments,
-                         xflash_content, tmpdir, firmware_path, request):
+                         xflash_content, tmpdir, firmware_path, request, qemu_img_path):
     # create empty eeprom banks
     bank_size = 65536
-    bank_1 = tmpdir / 'eeprom_bank1.bin'
-    bank_2 = tmpdir / 'eeprom_bank2.bin'
+    bank_1 = tmpdir / 'eeprom_bank1.qcow2'
+    bank_2 = tmpdir / 'eeprom_bank2.qcow2'
+    await create_qcow2_image_file(qemu_img_path, bank_1, bank_size)
+    await create_qcow2_image_file(qemu_img_path, bank_2, bank_size)
     bank_paths = (bank_1, bank_2)
-    for bank_path in bank_paths:
-        with open(bank_path, 'wb') as f:
-            f.seek(bank_size - 1)
-            f.write(b'\x00')
 
     # empty eeprom requested
     if not eeprom_variables:
@@ -246,17 +278,43 @@ def basic_printer_arguments(simulator_path, firmware_path,
                 nographic=not enable_graphic)
 
 
+phase_report_key = StashKey[dict[str, CollectReport]]()
+
 @pytest_asyncio.fixture
 async def printer_factory(basic_printer_arguments, xflash_content,
-                          eeprom_content, printer_flash_dir):
+                          eeprom_content, printer_flash_dir, 
+                          snapshots_image_file_path, debug_command_file_path,
+                          request):
+    def is_test_failed():
+        report = request.node.stash.get(phase_report_key, {})
+        setup_passed = report["setup"].passed if "setup" in report else True
+        call_passed = report["call"].passed if "call" in report else True
+        logging.info(f"TestReport [contains phase, phase succeeded]: Setup: [{'setup' in report}, {setup_passed}], Call: [{'call' in report}, {call_passed}]")
+        return not setup_passed or not call_passed
+
     return functools.partial(Simulator.run,
                              **basic_printer_arguments,
                              eeprom_content=eeprom_content,
                              xflash_content=xflash_content,
-                             mount_dir_as_flash=printer_flash_dir)
+                             mount_dir_as_flash=printer_flash_dir,
+                             snapshots_path=snapshots_image_file_path,
+                             file_path_to_save_command_for_debugging=debug_command_file_path,
+                             should_save_crashdump_func=is_test_failed)
 
 
 @pytest_asyncio.fixture
 async def printer(printer_factory):
     async with printer_factory() as printer:
         yield printer
+
+
+# inspired by this: https://docs.pytest.org/en/latest/example/simple.html#making-test-result-information-available-in-fixtures
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    # execute all other hooks to obtain the report object
+    outcome = yield
+    rep = outcome.get_result()
+    # store test results for each phase of a call, which can
+    # be "setup", "call", "teardown"
+    item.stash.setdefault(phase_report_key, {})[rep.when] = rep
+    logging.info(f"Saving test result for phase '{rep.when}'. Success: {rep.passed}")

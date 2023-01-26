@@ -12,7 +12,7 @@ from .pubsub import Publisher
 from .printer import Thermistor, MachineType, NetworkInterface
 
 logger = logging.getLogger('simulator')
-
+snapshot_name = "vm"
 
 class Simulator:
     def __init__(self, *, process: asyncio.subprocess.Process,
@@ -48,8 +48,10 @@ class Simulator:
                   mount_dir_as_flash: Path = None,
                   eeprom_content: Tuple[Path, Path] = None,
                   xflash_content: Path = None,
-                  nographic=False):
-        monitor_port = Simulator._get_available_port()
+                  nographic=False,
+                  snapshots_path: Path=None,
+                  file_path_to_save_command_for_debugging: str=None,
+                  should_save_crashdump_func=None):
         # prepare the arguments
         params = ['-machine', machine.value]
         params += ['-kernel', str(firmware_path)]
@@ -61,9 +63,16 @@ class Simulator:
         params += [
             '-netdev', f'user,id=mini-eth,hostfwd=tcp::{http_proxy_port}-:80'
         ]
+        # use for example this to setup telnet connection to send commands (savevm) to qemu monitor from scripts
+        # params += [
+        #     '-chardev',
+        #     'socket,id=monitor,host=localhost,port=4444,server,nowait,telnet',
+        #     '-mon', 
+        #     'chardev=monitor,mode=readline'
+        # ]
         if mount_dir_as_flash:
             params += [
-                '-drive', f'id=usbstick,file=fat:rw:{mount_dir_as_flash}'
+                '-drive', f'id=usbstick,readonly=true,file=fat:{mount_dir_as_flash}'
             ]
             params += [
                 '-device',
@@ -76,10 +85,13 @@ class Simulator:
             params += ['-mtdblock', str(xflash_content)]
         if nographic:
             params += ['-nographic']
+        if snapshots_path:
+            params += ['-drive', f'if=none,format=qcow2,file={str(snapshots_path)}']
 
         # start the simulator
         logger.info('starting simulator with command: %s %s', simulator_path,
                     ' '.join(params))
+
         process = await asyncio.create_subprocess_exec(
             str(simulator_path), *params, stdout=asyncio.subprocess.PIPE)
 
@@ -120,6 +132,16 @@ class Simulator:
                             scriptio_writer=scriptio_writer,
                             http_proxy_port=http_proxy_port)
         finally:
+            if should_save_crashdump_func:
+                should_save_crashdump = should_save_crashdump_func()
+                logging.info(f"Evaluating if should save crashdump. Result: {should_save_crashdump}")
+                if should_save_crashdump:
+                    Simulator.save_snapshot()
+                    if file_path_to_save_command_for_debugging:
+                        with open(file_path_to_save_command_for_debugging, 'w') as f:
+                            # -s is a shorthand for '-gdb localhost:1234'
+                            f.write(str(simulator_path) + ' '.join(params) + f" -s -loadvm {snapshot_name}")
+
             scriptio_writer.close()  # type: ignore
             await scriptio_writer.wait_closed()  # type: ignore
             process.terminate()
@@ -209,3 +231,16 @@ class Simulator:
 
     def network_proxy_http_port_get(self):
         return self.http_proxy_port
+
+    #
+    # snapshots
+    #
+    
+    @staticmethod
+    def save_snapshot():
+        logging.warning("HERE IT SHOULD SAVE SNAPSHOT.")
+        # todo: implement this properly, something like here:
+        # https://translatedcode.wordpress.com/2015/07/06/tricks-for-debugging-qemu-savevm-snapshots/
+            # spawn telnet localhost 4444
+            # expect "(qemu)"
+            # send "savevm {snapshot_name}\r"
