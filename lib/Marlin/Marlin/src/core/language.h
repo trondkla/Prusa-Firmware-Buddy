@@ -61,6 +61,7 @@
 // jp_kana    Japanese
 // ko_KR      Korean (South Korea)
 // nl         Dutch
+// no         Norwegian (Bokmål)
 // pl         Polish
 // pt         Portuguese
 // pt_br      Portuguese (Brazilian)
